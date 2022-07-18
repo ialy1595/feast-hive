@@ -82,7 +82,7 @@ class HiveSource(DataSource):
         self,
         table: Optional[str] = None,
         query: Optional[str] = None,
-        event_timestamp_column: Optional[str] = "",
+        timestamp_field: Optional[str] = "",
         created_timestamp_column: Optional[str] = "",
         field_mapping: Optional[Dict[str, str]] = None,
         date_partition_column: Optional[str] = "",
@@ -92,10 +92,10 @@ class HiveSource(DataSource):
         ), '"table" or "query" is required for HiveSource.'
 
         super().__init__(
-            event_timestamp_column,
-            created_timestamp_column,
-            field_mapping,
-            date_partition_column,
+            timestamp_field=timestamp_field,
+            created_timestamp_column=created_timestamp_column,
+            field_mapping=field_mapping,
+            date_partition_column=date_partition_column,
         )
 
         self._hive_options = HiveOptions(table=table, query=query)
@@ -107,11 +107,14 @@ class HiveSource(DataSource):
         return (
             self.hive_options.table == other.hive_options.table
             and self.hive_options.query == other.hive_options.query
-            and self.event_timestamp_column == other.event_timestamp_column
+            and self.timestamp_field == other.timestamp_field
             and self.created_timestamp_column == other.created_timestamp_column
             and self.field_mapping == other.field_mapping
             and self.date_partition_column == other.date_partition_column
         )
+
+    def __hash__(self):
+        return hash(repr(self))
 
     @property
     def table(self):
@@ -142,7 +145,7 @@ class HiveSource(DataSource):
             custom_options=self.hive_options.to_proto(),
         )
 
-        data_source_proto.event_timestamp_column = self.event_timestamp_column
+        data_source_proto.timestamp_field = self.timestamp_field
         data_source_proto.created_timestamp_column = self.created_timestamp_column
         data_source_proto.date_partition_column = self.date_partition_column
         return data_source_proto
@@ -158,7 +161,7 @@ class HiveSource(DataSource):
             field_mapping=dict(data_source.field_mapping),
             table=hive_options.table,
             query=hive_options.query,
-            event_timestamp_column=data_source.event_timestamp_column,
+            timestamp_field=data_source.timestamp_field,
             created_timestamp_column=data_source.created_timestamp_column,
             date_partition_column=data_source.date_partition_column,
         )

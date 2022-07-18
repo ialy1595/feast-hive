@@ -15,10 +15,15 @@ from feast.data_source import DataSource
 from feast.errors import InvalidEntityType
 from feast.feature_view import DUMMY_ENTITY_ID, DUMMY_ENTITY_VAL
 from feast.infra.offline_stores import offline_utils
-from feast.infra.offline_stores.offline_store import OfflineStore, RetrievalJob
+from feast.infra.offline_stores.offline_store import (
+    OfflineStore,
+    RetrievalJob,
+    RetrievalMetadata,
+)
 from feast.on_demand_feature_view import OnDemandFeatureView
 from feast.registry import Registry
 from feast.repo_config import FeastConfigBaseModel, RepoConfig
+from feast.saved_dataset import SavedDatasetStorage
 from feast_hive.hive_source import HiveSource
 from feast_hive.hive_type_map import hive_to_pa_value_type, pa_to_hive_value_type
 
@@ -146,7 +151,7 @@ class HiveOfflineStore(OfflineStore):
         data_source: DataSource,
         join_key_columns: List[str],
         feature_name_columns: List[str],
-        event_timestamp_column: str,
+        timestamp_field: str,
         created_timestamp_column: Optional[str],
         start_date: datetime,
         end_date: datetime,
@@ -161,7 +166,7 @@ class HiveOfflineStore(OfflineStore):
             partition_by_join_key_string = (
                 "PARTITION BY " + partition_by_join_key_string
             )
-        timestamps = [event_timestamp_column]
+        timestamps = [timestamp_field]
         if created_timestamp_column:
             timestamps.append(created_timestamp_column)
         timestamp_desc_string = " DESC, ".join(timestamps) + " DESC"
@@ -180,7 +185,7 @@ class HiveOfflineStore(OfflineStore):
                 SELECT {field_string},
                 ROW_NUMBER() OVER({partition_by_join_key_string} ORDER BY {timestamp_desc_string}) AS feast_row_
                 FROM {from_expression} t1
-                WHERE {event_timestamp_column} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
+                WHERE {timestamp_field} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
             ) t2
             WHERE feast_row_ = 1
             """,
@@ -250,7 +255,6 @@ class HiveOfflineStore(OfflineStore):
                     "SET hive.mapred.mode=nonstrict",
                     "SET hive.support.quoted.identifiers=none",
                     "SET hive.resultset.use.unique.column.names=false",
-                    "SET hive.exec.temporary.table.storage=memory",
                 ] + rendered_query.split(";")
 
                 yield queries
@@ -268,6 +272,38 @@ class HiveOfflineStore(OfflineStore):
             ),
         )
 
+    @staticmethod
+    def pull_all_from_table_or_query(
+        config: RepoConfig,
+        data_source: DataSource,
+        join_key_columns: List[str],
+        feature_name_columns: List[str],
+        timestamp_field: str,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> RetrievalJob:
+        assert isinstance(config.offline_store, HiveOfflineStoreConfig)
+        assert isinstance(data_source, HiveSource)
+
+        from_expression = data_source.get_table_query_string()
+
+        field_string = ", ".join(join_key_columns + feature_name_columns + [timestamp_field])
+
+        start_date = _format_datetime(start_date)
+        end_date = _format_datetime(end_date)
+
+        queries = [
+            "SET hive.resultset.use.unique.column.names=false",
+            f"""
+            SELECT {field_string}
+            FROM {from_expression}
+            WHERE {timestamp_field} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
+            """,
+        ]
+
+        conn = HiveConnection(config.offline_store)
+        return HiveRetrievalJob(conn, queries)
+
 
 class HiveRetrievalJob(RetrievalJob):
     def __init__(
@@ -276,6 +312,7 @@ class HiveRetrievalJob(RetrievalJob):
         queries: Union[str, List[str], Callable[[], ContextManager[List[str]]]],
         full_feature_names: bool = False,
         on_demand_feature_views: Optional[List[OnDemandFeatureView]] = None,
+        metadata: Optional[RetrievalMetadata] = None,
     ):
         assert (
             isinstance(queries, str) or isinstance(queries, list) or callable(queries)
@@ -301,6 +338,7 @@ class HiveRetrievalJob(RetrievalJob):
         self._conn = conn
         self._full_feature_names = full_feature_names
         self._on_demand_feature_views = on_demand_feature_views
+        self._metadata = metadata
 
     @property
     def full_feature_names(self) -> bool:
@@ -350,6 +388,12 @@ class HiveRetrievalJob(RetrievalJob):
             if column.nulls[i]:
                 values[i] = None
         return values
+    @property
+    def metadata(self) -> Optional[RetrievalMetadata]:
+        return self._metadata
+
+    def persist(self, storage: SavedDatasetStorage):
+        pass
 
 
 def _format_datetime(t: datetime):
@@ -550,11 +594,14 @@ CREATE TEMPORARY TABLE entity_dataframe AS (
 CREATE TEMPORARY TABLE {{ featureview.name }}__base AS
 WITH {{ featureview.name }}__entity_dataframe AS (
     SELECT
-        {{ featureview.entities | join(', ')}},
+        {% if featureview.entities %}{{ featureview.entities | join(', ') }},{% endif %}
         entity_timestamp,
         {{featureview.name}}__entity_row_unique_id
     FROM entity_dataframe
-    GROUP BY {{ featureview.entities | join(', ')}}, entity_timestamp, {{featureview.name}}__entity_row_unique_id
+    GROUP BY
+        {% if featureview.entities %}{{ featureview.entities | join(', ') }},{% endif %}
+        entity_timestamp,
+        {{featureview.name}}__entity_row_unique_id
 ),
 
 /*
@@ -563,9 +610,9 @@ WITH {{ featureview.name }}__entity_dataframe AS (
 
  1. We first join the current feature_view to the entity dataframe that has been passed.
  This JOIN has the following logic:
-    - For each row of the entity dataframe, only keep the rows where the `event_timestamp_column`
+    - For each row of the entity dataframe, only keep the rows where the `timestamp_field`
     is less than the one provided in the entity dataframe
-    - If there a TTL for the current feature_view, also keep the rows where the `event_timestamp_column`
+    - If there a TTL for the current feature_view, also keep the rows where the `timestamp_field`
     is higher the the one provided minus the TTL
     - For each row, Join on the entity key and retrieve the `entity_row_unique_id` that has been
     computed previously
@@ -576,7 +623,7 @@ WITH {{ featureview.name }}__entity_dataframe AS (
 
 {{ featureview.name }}__subquery AS (
     SELECT
-        {{ featureview.event_timestamp_column }} as event_timestamp,
+        {{ featureview.timestamp_field }} as event_timestamp,
         {{ featureview.created_timestamp_column ~ ' as created_timestamp,' if featureview.created_timestamp_column else '' }}
         {{ featureview.entity_selections | join(', ')}}{% if featureview.entity_selections %},{% else %}{% endif %}
         {% for feature in featureview.features %}
@@ -591,9 +638,9 @@ WITH {{ featureview.name }}__entity_dataframe AS (
         FROM entity_dataframe
     ) AS temp
     ON (
-        {{ featureview.event_timestamp_column }} <= max_entity_timestamp_
+        {{ featureview.timestamp_field }} <= max_entity_timestamp_
         {% if featureview.ttl == 0 %}{% else %}
-        AND {{ featureview.event_timestamp_column }} >=  min_entity_timestamp_
+        AND {{ featureview.timestamp_field }} >=  min_entity_timestamp_
         {% endif %}
     )
 )
