@@ -141,6 +141,7 @@ class HiveSource(DataSource):
     def to_proto(self) -> DataSourceProto:
         data_source_proto = DataSourceProto(
             type=DataSourceProto.CUSTOM_SOURCE,
+            data_source_class_type="feast_hive.HiveSource",
             field_mapping=self.field_mapping,
             custom_options=self.hive_options.to_proto(),
         )
